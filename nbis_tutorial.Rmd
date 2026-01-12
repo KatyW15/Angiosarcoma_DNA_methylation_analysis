@@ -1,0 +1,782 @@
+---
+title: "NBIS_tutorial"
+output: html_document
+date: "2025-12-10"
+editor_options: 
+  chunk_output_type: console
+---
+ 
+tutorial found here: https://nbis-workshop-epigenomics.readthedocs.io/en/latest/content/tutorials/methylationArray/Array_Tutorial.html
+
+
+```{r}
+setwd("/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis/")
+#BiocManager::install("limma")
+#BiocManager::install("minfi", force = TRUE)
+#BiocManager::install("SummarizedExperiment", force = TRUE)
+#BiocManager::install("SparseArray")
+#BiocManager::install("missMethyl", force = TRUE)
+#BiocManager::install("minfiData")
+#BiocManager::install("Gviz")
+#BiocManager::install("DMRcate")
+#BiocManager::install("DMRcatedata")
+#BiocManager::install("mCSEA")
+#BiocManager::install("Homo.sapiens")
+#BiocManager::install("sesame")
+#BiocManager::install("tidyverse")
+
+# load packages required for analysis
+library("limma")
+library("minfi")
+library("RColorBrewer")
+library("missMethyl") # Can take a short time...
+library("minfiData")
+library("Gviz")
+library("DMRcate")
+library("DMRcatedata")
+library("stringr")
+library("mCSEA")
+library("sesame")
+library("tidyverse")
+
+
+
+EPIC_ann <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+
+```
+
+
+```{r make samples list}
+
+dataDirectory <- "/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis/all_idat_files/"
+# list the files
+list.files(dataDirectory, recursive = TRUE)
+# read in the sample sheet for the experiment
+targets <- read.metharray.sheet("/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis" ,pattern="Wang_16_samplesheet_12082025_csv.csv")
+
+```
+
+```{r read-in idat data}
+# read in the raw data from the IDAT files; warnings can be ignored.
+rgSet <- read.metharray.exp(targets=targets)
+
+# Get an overview of the data
+rgSet
+pData(rgSet)
+getManifest(rgSet)
+
+
+# give the samples descriptive names
+targets$ID <- paste(1:16, c( "GM", "CM_P", "CM_WT", "WT_Ivo", "H1", "H2", "H_Ivo_1", "H_Ivo_2", "C1", "C2", "C_Ivo_1", "C_Ivo_2", "D2HG", "HT_GM", "HT_CM", "HT_CM_Ivo"), sep = "_")
+sampleNames(rgSet) <- targets$ID
+
+# Check the names have been updated by looking at the rownames of the phenoData
+pData(rgSet)
+```
+
+
+"As of now, our dataset is an RGChannelSet object containing the raw green and red intensity data. To proceed, this needs to be transformed into a MethylSet object containing the methylated and unmethylated signals. The most basic way to construct a MethylSet is to use the function preprocessRaw which uses the array design to match up the different probes and color channels to construct the methylated and unmethylated signals. This function does not do any normalization (in a later step we will add normalization, but this step is useful for initial quality control)." 
+```{r}
+MSet <- preprocessRaw(rgSet) #change to MethylSet format
+MSet
+rgSet #for comparison
+
+#can see meth and unmeth sets
+head(getMeth(MSet)[,1:3])
+head(getUnmeth(MSet)[,1:3])
+```
+
+
+"A RatioSet object is class designed to store Beta and/or M-values instead of the (un)methylated signals. An optional copy number matrix, CN, the sum of the methylated and unmethylated signals, can be also stored."
+
+"The function mapToGenome applied to a RatioSet object will add genomic coordinates to each probe together with some additional annotation information. The output object is a GenomicRatioSet"
+```{r}
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+# Observe the change of the assays
+ratioSet
+
+gset <- mapToGenome(ratioSet)
+gset
+
+#pull out beta values, M values, and copy numbers
+beta <- getBeta(gset)
+head(beta)
+m <- getM(gset)
+head(m)
+cn <- getCN(gset)
+head(cn)
+```
+
+
+
+
+### Quality Control ###
+
+"minfi provides a simple quality control plot that uses the log median intensity in both the methylated (M) and unmethylated (U) channels. When plotting these two medians against each other, good samples tend to cluster together, while failed samples tend to separate and have lower median intensities. In general, users should make the plot and make a judgement. The line separating ”bad” from ”good” samples represent a useful cutoff, which is not always very clear and may have to be adapted to a specific dataset. The functions getQC and plotQC) are designed to extract and plot the quality control information from the MethylSet."
+```{r}
+qc <- getQC(MSet)
+plotQC(qc) #all samples are black circles which are labeled as "good"
+#all clustered together, two are slight outliers
+```
+
+
+"In general, a decision of good versus bad quality should be based on multiple metrics, not just one. Therefore, we can additionally look at the detection p-values for every CpG in every sample, which is indicative of the quality of the signal. The method used by minfi to calculate detection p-values compares the total signal (M+U) for each probe to the background signal level, which is estimated from the negative control probes. Very small p-values are indicative of a reliable signal whilst large p-values, for example >0.01, generally indicate a poor quality signal."
+```{r}
+# calculate the detection p-values
+detP <- detectionP(rgSet)
+head(detP)
+
+# examine mean detection p-values across all samples to identify any failed samples
+barplot(colMeans(detP), las=2, cex.names=0.8, ylab="Mean detection p-values")
+abline(h=0.05,col="red") #"bad" cutoff at 0.05
+## all of our samples have very low mean detection p-val (max 0.001) which is good
+## sample 16_HT_CM_Ivo has the highest, but they all look good
+```
+
+
+
+"The overall density distribution of Beta values for each sample is another useful metric to determine sample quality. Usually, one would expect to see most Beta values to be either close to 0 or 1, indicating most of the CpG sites in the sample are unmethylated or methylated. The densityPlot function plots these distribution for each sample."
+```{r}
+phenoData <- pData(MSet)
+densityPlot(MSet) 
+#looks pretty good, all have the same trace
+#generally ~0.1 or 0.9, some in between with slight peak around 0.65
+```
+
+
+plot all QC plots together
+```{r}
+par(mfrow=c(1,3))
+plotQC(qc) #all samples are black circles which are labeled as "good"
+barplot(colMeans(detP), las=2, cex.names=0.8, ylab="Mean detection p-values")
+densityPlot(MSet) 
+dev.off()
+```
+
+PASSED ALL QC METRICS!! :)
+
+
+
+### Normalization ###
+used Funnorm method
+
+```{r}
+# normalize the data; this results in a GenomicRatioSet object
+mSetSq <- preprocessFunnorm(rgSet)
+
+```
+
+
+"Compare with the unnormalized data to visualize the effect of the normalization. First a comparison of the Beta distributions for the different probe designs. This will give an indication of the effectiveness of the within-array normalization."
+```{r}
+par(mfrow=c(1,2))
+# Plot distributions prior to normalization for sample 1
+plotBetasByType(MSet[,1],main="Raw", legendPos = FALSE)
+# The normalized object is a GenomicRatioSet which does not contain
+# the necessary probe info, we need to extract this from the MethylSet first.
+typeI <- getProbeInfo(MSet, type = "I")[, c("Name","nCpG")]
+typeII <- getProbeInfo(MSet, type = "II")[, c("Name","nCpG")]
+probeTypes <- rbind(typeI, typeII)
+probeTypes$Type <- rep(x = c("I", "II"), times = c(nrow(typeI), nrow(typeII)))
+# Now plot the distributions of the normalized data for sample 1
+plotBetasByType(getBeta(mSetSq)[,1], probeTypes = probeTypes, main="Normalized",legendPos = FALSE)
+## removed legends to see plots\
+
+```
+KW: normalization increased the 0.1 beta values over the 0.8 ones... not sure what to make of that
+
+
+between array normalization check
+```{r}
+# visualise what the data looks like before and after normalisation
+par(mfrow=c(1,2))
+densityPlot(rgSet, main="Raw", legend=FALSE)
+#legend("top", text.col=brewer.pal(8,"Dark2"))
+densityPlot(getBeta(mSetSq),
+            main="Normalized", legend=FALSE)
+#legend("top", legend = levels(factor(targets$Sample_Group)), text.col=brewer.pal(8,"Dark2"))
+```
+KW: interesting... the normalized data is higher in 0.1 peak than 0.8 peak which is the opposite of the Raw data. Not sure if that's good or bad. Tutorial doesn't specify.
+
+
+
+### Data Exploration ###
+
+"After normalization of your data is a good time to look at the similarities and differences between the various samples. One way to do this is by creating a MDS or Multi-Dimenional Scaling plot. This is a method to graphically represent relationships between objects (here the different samples) in multidimensional space onto 2 or 3 dimensional space. Dimension one (or principal component one) captures the greatest source of variation in the data, dimension two captures the second greatest source of variation in the data and so on." 
+
+
+```{r unfiltered}
+# MDS plots to look at largest sources of variation
+# Create color panel
+pal <- brewer.pal(16,"Dark2")
+# Plot figures
+#par(mfrow=c(1,2))
+plot.new()
+plotMDS(getM(mSetSq), top=1000, gene.selection="common",
+        col=pal[factor(targets$Sample_Name)])
+legend("right", legend=levels(factor(targets$Sample_Name)), text.col=pal,
+       bg="white", cex=0.5)
+# Close plotting window
+dev.off()
+
+```
+
+
+Filter out bad probes
+```{r}
+# ensure probes are in the same order in the mSetSq and detP objects
+detP <- detectionP(rgSet)
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),]
+
+# remove any probes that have failed in one or more samples; this next line
+# checks for each row of detP whether the number of values < 0.01 is equal
+# to the number of samples (TRUE) or not (FALSE)
+keep <- rowSums(detP < 0.01) == ncol(mSetSq)
+table(keep)
+# FALSE   TRUE 
+#  4295 925780 
+
+# Subset the GenomicRatioSet
+mSetSqFlt <- mSetSq[keep,]
+mSetSqFlt
+
+#to remove genes with common SNPs -> didn't do since looking at some samples with IDH SNPs
+#mSetSqFlt <- dropLociWithSnps(mSetSqFlt)
+
+```
+
+```{r filtered PCA plot}
+pal2 <- grDevices::rainbow(16)
+
+#plot.new()
+par(mar=c(4.1, 4.1, 4.1, 4.1), xpd=TRUE)
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", #pch = c(16), 
+        col=pal2[factor(targets$Sample_Name)]) #labels = targets$Sample_Name,
+legend("topright", inset=c(-1.35,0), legend=levels(factor(targets$Sample_Name)), text.col=pal2, bg="white", cex=0.7, ncol = 2)
+# Close plotting window
+dev.off()
+?plotMDS
+?legend
+```
+
+
+
+
+
+### differential analysis ###
+
+rebuild data sets with better descriptors and groups
+*Just subset of samples with corrected labels*
+```{r rebuild data}
+targets <- read.metharray.sheet("/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis" ,pattern="Wang_16_samplesheet_12082025_csv_CORRECTED.csv")
+
+rgSet <- read.metharray.exp(targets=targets)
+
+MSet <- preprocessRaw(rgSet) #change to MethylSet format
+
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+
+gset <- mapToGenome(ratioSet)
+
+#normalization
+mSetSq <- preprocessFunnorm(rgSet)
+
+#filtering
+detP <- detectionP(rgSet)
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),]
+keep <- rowSums(detP < 0.01) == ncol(mSetSq)
+mSetSqFlt <- mSetSq[keep,]
+
+#get Beta values
+beta <- as.data.frame(getBeta(mSetSqFlt)) #get beta values for each probe
+
+#get gene info and add to Beta table
+EPIC_ann <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38) #gene info
+
+#mSetSqFlt_EPIC_ann <- EPIC_ann[match(rownames(mSetSqFlt),EPIC_ann$Name), c(1:4,12:19,24:ncol(EPIC_ann))] #can add to mSet
+## got gene info into mSetSqFlt but not sure how to get it back out...
+
+EPIC_ann_select <- as.data.frame(EPIC_ann[c(4,1:3,18,19,28:30,36)]) # select specific cols, put into df format to join w/Betas
+
+beta <- rownames_to_column(beta, "Name") #probe ID's are under "Name" in genomic df
+beta_gene <- left_join(beta, EPIC_ann_select, by = "Name") #add genomic data
+colnames(beta_gene) <- c("probeID", 
+                         "Parental_betas", "IDH1_WT_betas", "IDH1_WT_Ivo_betas", "R132H_betas", "R132H_Ivo_betas", "R132C_betas", "R132C_Ivo_betas", "p53KD_ctl_betas", "p53KD_R132H_betas", "p53KD_R132H_Ivo_betas", "p53KD_R132C_betas", "p53KD_R132C_Ivo_betas", "D2HG_betas", "HT_GM_betas", "HT_CM_betas", "HT_CM_Ivo_betas", 
+                         colnames(beta_gene[ c((ncol(beta_gene)-8):ncol(beta_gene)) ])) #fix col names, add sample names
+#sample_names_ls <- c("Parental", "IDH1_WT", "IDH1_WT_Ivo", "R132H", "R132H_Ivo", "R132C", "R132C_Ivo", "p53KD_ctl_betas", "p53KD_R132H", "p53KD_R132H_Ivo", "p53KD_R132C", "p53KD_R132C_Ivo", "D2HG", "HT_GM", "HT_CM", "HT_CM_Ivo")
+
+#save beta values to one drive to save space on my computer
+write_delim(as.data.frame(beta_gene), "beta_values_table_funnorm_ALL_samples_gene_info.csv", delim = ",", col_names = TRUE)
+
+```
+
+
+```{r looking for specific genes from Dong-Min's list}
+NOS3 <- filter(beta_gene, beta_gene$UCSC_RefGene_Name == "NOS3")
+CDH5 <- filter(beta_gene, beta_gene$UCSC_RefGene_Name == "CDH5")
+ANGPT2 <- filter(beta_gene, beta_gene$UCSC_RefGene_Name == "ANGPT2" | beta_gene$UCSC_RefGene_Name == "GPT2")
+TEK <- filter(beta_gene, beta_gene$UCSC_RefGene_Name == "TEK")
+HMOX1 <- filter(beta_gene, beta_gene$UCSC_RefGene_Name == "HMOX1")
+
+#none of these show differences between samples
+
+individ_genes_bvals <- filter(beta_gene, beta_gene$UCSC_RefGene_Name == "NOS3" | 
+                                beta_gene$UCSC_RefGene_Name == "CDH5" |
+                                beta_gene$UCSC_RefGene_Name == "ANGPT2" |
+                                beta_gene$UCSC_RefGene_Name == "GPT2" |
+                                beta_gene$UCSC_RefGene_Name == "TEK" |
+                                beta_gene$UCSC_RefGene_Name == "HMOX1" |
+                                beta_gene$UCSC_RefGene_Name == "CCND1" |
+                                beta_gene$UCSC_RefGene_Name == "MCL1" |
+                                beta_gene$UCSC_RefGene_Name == "PECAM1" |
+                                beta_gene$UCSC_RefGene_Name == "VWF" |
+                                beta_gene$UCSC_RefGene_Name == "SERPINH1" |
+                                beta_gene$UCSC_RefGene_Name == "TIMP1" |
+                                beta_gene$UCSC_RefGene_Name == "SPRY4" |
+                                beta_gene$UCSC_RefGene_Name == "PLP2" |
+                                beta_gene$UCSC_RefGene_Name == "CALCRL" |
+                                beta_gene$UCSC_RefGene_Name == "ICAM2" |
+                                beta_gene$UCSC_RefGene_Name == "SELP"
+                              )
+#save
+write_delim(as.data.frame(individ_genes_bvals), "DM_genes_beta_values_table_funnorm_ALL_samples_gene_info.csv", delim = ",", col_names = TRUE)
+
+```
+
+
+
+PCA
+```{r filtered PCA plot}
+pal <- brewer.pal(8,"Dark2")
+pal2 <- grDevices::rainbow(16)
+
+#plot.new()
+par(mar=c(4.1, 4.1, 4.1, 11.1), xpd=TRUE)
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", pch = c(16), col=pal[factor(targets$Sample_Name)]) ##labels = targets$Sample_Name,
+legend("topright", inset=c(-0.65,0), legend=levels(factor(targets$Sample_Name)), text.col=pal, bg="white", cex=0.8, bty = "n")
+# Close plotting window
+dev.off()
+?plotMDS
+?legend
+```
+
+
+
+heatmap
+```{r}
+# eXtract Beta-values
+bVals <- getBeta(mSetSq) #b-vals post-filtering
+
+#save
+#bVals <- as.data.frame(bVals) #convert to df
+#colnames(bVals) <- c("Parental", "IDH1 WT", "IDH1 WT Ivosidenib", "R132H","R132H Ivosidenib", "R132C", "R132C Ivosidenib", "D2HG"  )
+write_delim(rownames_to_column(bVals, "probe_ID"), "beta_values_table_from_minfi_Norm_filtered_CORRECTED.csv", delim = ",", col_names = TRUE)
+
+
+
+#want to filter for the most highly variable probes
+  #first assign variant_score
+t <- rowSds(bVals) #needs to be matrix 
+bVals <- as.data.frame(bVals) #convert to df
+bVals$stdev_variance <- unname(t) #add as col
+summary(bVals$stdev_variance)
+#     Min.   1st Qu.    Median      Mean   3rd Qu.      Max. 
+#0.0002358 0.0069609 0.0117419 0.0146733 0.0187660 0.4866292 
+
+
+
+
+###filter by highest standard deviation (keep top 2,000)
+t2 <- arrange(bVals, stdev_variance)
+bVals_top_2k <- tail(t2, 2000)
+colnames(bVals_top_2k) <- c("Parental", "IDH1 WT", "IDH1 WT Ivosidenib", "R132H","R132H Ivosidenib", "R132C", "R132C Ivosidenib", "D2HG", "stdev_variance"  )
+#what about top 200?
+bVals_top_200 <- tail(bVals_top_2k, 200)
+
+#Ok... what about the top varriant genes only between R132C and R132C +Ivo?
+bVals <- getBeta(mSetSq) #make bVals as a matrix for rowSDs
+t3 <- rowSds(bVals[,c(1,6)]) 
+bVals <- as.data.frame(bVals) #convert to df
+colnames(bVals) <- c("Parental", "IDH1 WT", "IDH1 WT Ivosidenib", "R132H","R132H Ivosidenib", "R132C", "R132C Ivosidenib", "D2HG"  )
+bVals$R132CvP_stdev <- unname(t3) #add as col
+t4 <- arrange(bVals, R132CvP_stdev)
+bVals_R132CvP_2k <- tail(t4, 2000)
+
+#plot
+#library(pheatmap)
+pheatmap(t(bVals_R132CvP_2k[c(1,6,7)]), show_colnames = FALSE)
+#swap row and col = transpose with t()
+#fix legend labels
+#remove cpg labels
+#don't show top dendrogram (CpG sites) = treeheight_col = 0
+
+
+#save out heatmap plotting data with genomic info
+t <- rownames_to_column(DMPs, "probe_ID")
+t2<- left_join(rownames_to_column(bVals_R132CvP_2k, "probe_ID"), t[,1:32], by = "probe_ID")
+write_delim(t2, "beta_values_w_genome_info_R132C_vs_parental_top2k.csv", delim = ",", col_names = TRUE)
+
+
+```
+
+
+
+
+
+### Diff. exp linear modeling ###
+I want to compare +Ivo to their respective cell types -Ivo (i.e.R132H to R132H+Ivo)
+no replicates or individuals to average
+
+*no significant diff CpGs with all samples WT vs IDH mut or untreated v Ivo*
+--> taking out D2HG and IDH WT samples and trying again
+*still no sig diff CpGs between low_d2HG (parental and +Ivo), and high_D2HG (R132C/H)*
+--> what about just getting top diff sites between parental and IDH mutants?
+*10 hits, slightly better. I think this is further proof that R132C and H are not similar*
+
+
+**ultimately I think the issue is that there aren't replicates so very few genes are passing the p-adj threshold**
+
+
+Diff exp: simple assessment, just asking which genes increase or decrease between key samples
+```{r Diff exp: simple comparison}
+beta_gene <- read.csv("beta_values_table_funnorm_ALL_samples_gene_info.csv")
+
+H_over_Parental_betas <- filter(beta_gene, beta_gene$R132H_betas > beta_gene$Parental_betas )
+H_under_Parental_betas <- filter(beta_gene, beta_gene$R132H_betas < beta_gene$Parental_betas) #almost 50/50
+
+beta_gene$R132H_higher_than_Parent <- beta_gene$R132H_betas > beta_gene$Parental_betas
+beta_gene$R132H_higher_than_wIvo <- beta_gene$R132H_betas >= beta_gene$R132H_Ivo_betas
+beta_gene$R132C_higher_than_Parent <- beta_gene$R132C_betas > beta_gene$Parental_betas
+beta_gene$R132C_higher_than_wIvo <- beta_gene$R132C_betas >= beta_gene$R132C_Ivo_betas
+
+table(beta_gene$R132H_higher_than_Parent)
+# FALSE   TRUE 
+#423,165 502,615 
+
+table(beta_gene$R132H_higher_than_wIvo)
+# FALSE   TRUE 
+#505,878 419,902  
+
+table(beta_gene$R132C_higher_than_Parent)
+# FALSE   TRUE 
+#366,831 558,949  
+
+table(beta_gene$R132C_higher_than_wIvo)
+# FALSE   TRUE 
+#442,805 482,975 
+
+table(beta_gene$D2HG_betas >= beta_gene$Parental_betas)
+# FALSE   TRUE 
+#309691 616089 
+
+## most of these are ~50/50 
+## let's calculate FC's and set a threshold of 1.5 or 2-fold
+
+FC_betas <- data.frame(probeID = beta_gene$probeID,
+                       R132C_d_Parental_FC = (beta_gene$R132C_betas / beta_gene$Parental_betas),
+                       R132C_d_Ivo_FC = (beta_gene$R132C_betas / beta_gene$R132C_Ivo_betas),
+                       R132H_d_Parental_FC = (beta_gene$R132H_betas / beta_gene$Parental_betas),
+                       R132H_d_Ivo_FC = (beta_gene$R132H_betas / beta_gene$R132H_Ivo_betas),
+                       D2HG_d_Parental_FC = (beta_gene$D2HG_betas / beta_gene$Parental_betas)
+                       )
+#what does this look like?
+summary(FC_betas[c(2:6)])
+#R132C_d_Parental_FC R132C_d_Ivo_FC      R132H_d_Parental_FC R132H_d_Ivo_FC      D2HG_d_Parental_FC 
+# Min.   :4.931e-03   Min.   :  0.00366   Min.   : 0.004813   Min.   : 0.005026   Min.   :2.389e-03  
+# 1st Qu.:9.755e-01   1st Qu.:  0.95004   1st Qu.: 0.968590   1st Qu.: 0.952860   1st Qu.:9.885e-01  
+# Median :1.009e+00   Median :  1.00195   Median : 1.003577   Median : 0.996139   Median :1.021e+00  
+# Mean   :1.017e+00   Mean   :  0.99563   Mean   : 1.011990   Mean   : 0.995680   Mean   :1.090e+00  
+# 3rd Qu.:1.046e+00   3rd Qu.:  1.03098   3rd Qu.: 1.037545   3rd Qu.: 1.023476   3rd Qu.:1.121e+00  
+# Max.   :1.068e+02   Max.   :516.59025   Max.   :59.051519   Max.   :78.394804   Max.   :1.120e+02  
+
+table(FC_betas$R132C_d_Parental_FC >2) #1.5-fold: 12,563 CpG; 2-fold: 1,680 CpG
+table(FC_betas$R132H_d_Parental_FC >1.5) #1.5-fold: 11,582 CpG; 2-fold: 1,566 CpG
+table(FC_betas$R132C_d_Ivo_FC >2) #1.5-fold: 10,495 CpG; 2-fold: 1,455 CpG
+table(FC_betas$R132H_d_Ivo_FC >2) #1.5-fold: 9,598 CpG; 2-fold: 1,302 CpG
+0.9/0.4
+#1.5-fold would include CpG that go from 0.6 to 0.9 
+#2-fold would include CpG that go from 0.45 to 0.9
+# given the large difference between 1.5 and 2-fold it seems like there's a lot of CpG that are in the middle 0.5-ish region
+# let's double check that we aren't enriching for super low FC's at 2-fold
+t <- filter(FC_betas, FC_betas$R132C_d_Parental_FC >2)
+summary(filter(beta_gene, beta_gene$probeID %in% t$probeID)[c(2,7)])
+# Ok... most of the CpG are below 0.1 even in the R132C (which is by definition higher than parental)
+##
+### FC doesn't look like a good metric ###
+##
+
+
+##
+### set thresholds based on B-val distribution ###
+##
+#essentially we're asking if CpG go from ~0.1 to ~0.9 so let's ask that more directly
+## based on QC plots, the low and high peaks go from 0-0.2 and 0.8-1 respectively
+
+# ask which CpG go from <0.2 to >0.8
+t <- filter(beta_gene, beta_gene$R132H_betas >0.8 & beta_gene$Parental_betas <0.2) #7 CpG...
+#what about the other way, methyl in Parental to unmethyl in mut
+t2 <- filter(beta_gene, beta_gene$Parental_betas >0.8 & beta_gene$R132H_betas <0.2) #4 CpG...
+## how many CpG are <0.2 or >0.8?
+nrow(filter(beta_gene, beta_gene$R132H_betas >0.8 | beta_gene$R132H_betas<0.2)) #the majority are
+#parental: 662k (71%), R132H: 668K (72%)
+662070 / 925780 
+
+## what about D2HG since that would be the pos ctl
+t3 <- filter(beta_gene, beta_gene$Parental_betas >0.7 & beta_gene$D2HG_betas <0.3) #15 low to high, 9 high to low - so a few more but not that different
+
+## I just think there aren't large methylation changes in this data
+### let's get these numbers for all the comparisons, add it to the summary excel and call it a day
+#R132H v Parental
+nrow(filter(beta_gene, beta_gene$R132H_betas >0.7 & beta_gene$Parental_betas <0.3)) #7
+nrow(filter(beta_gene, beta_gene$Parental_betas >0.7 & beta_gene$R132H_betas <0.3)) #5
+# R132C v Parental
+nrow(filter(beta_gene, beta_gene$R132C_betas >0.7 & beta_gene$Parental_betas <0.3)) #9
+nrow(filter(beta_gene, beta_gene$Parental_betas >0.7 & beta_gene$R132C_betas <0.3)) #5
+#R132H v Ivo
+nrow(filter(beta_gene, beta_gene$R132H_betas >0.7 & beta_gene$R132H_Ivo_betas <0.3)) #3
+nrow(filter(beta_gene, beta_gene$R132H_Ivo_betas >0.7 & beta_gene$R132H_betas <0.3)) #5
+#R132C v Ivo
+nrow(filter(beta_gene, beta_gene$R132C_betas >0.7 & beta_gene$R132C_Ivo_betas <0.3)) #4
+nrow(filter(beta_gene, beta_gene$R132C_Ivo_betas >0.7 & beta_gene$R132C_betas <0.3)) #2
+
+## do H and C mutant hits overlap?
+H_high <- filter(beta_gene, beta_gene$R132H_betas >0.7 & beta_gene$Parental_betas <0.3)
+H_low <- filter(beta_gene, beta_gene$Parental_betas >0.7 & beta_gene$R132H_betas <0.3)
+C_high <- filter(beta_gene, beta_gene$R132C_betas >0.7 & beta_gene$Parental_betas <0.3)
+C_low <- filter(beta_gene, beta_gene$Parental_betas >0.7 & beta_gene$R132C_betas <0.3)
+
+library(VennDiagram)
+venn.diagram(x= list(H_high$probeID, C_high$probeID), 
+             category.names = c("R132H", "R132C"),
+             filename = "H_v_C_High_venn.png")
+venn.diagram(x= list(H_low$probeID, C_low$probeID), 
+             category.names = c("R132H", "R132C"),
+             filename = "H_v_C_Low_venn.png")
+#high overlap, but mostly due to parental being the outlier
+
+
+##
+### What about anything that changes by >0.2?
+##
+nrow(filter(beta_gene, abs(beta_gene$R132C_betas - beta_gene$Parental_betas) >=0.2)) #180 CpGs... still not very many considering there are 920k probes
+
+nrow(filter(beta_gene, abs(beta_gene$R132H_betas - beta_gene$Parental_betas) >=0.2)) #139
+nrow(filter(beta_gene, abs(beta_gene$R132C_betas - beta_gene$R132C_Ivo_betas) >=0.2)) #260
+nrow(filter(beta_gene, abs(beta_gene$R132H_betas - beta_gene$R132H_Ivo_betas) >=0.2)) #149
+
+## D2HG?
+nrow(filter(beta_gene, abs(beta_gene$D2HG_betas - beta_gene$Parental_betas) >=0.2)) #2059
+# so D2HG does have more sites that change but still not a lot
+
+
+# do R132H and R132C have similar genes that change?
+H <- filter(beta_gene, abs(beta_gene$R132H_betas - beta_gene$Parental_betas) >=0.2)
+C <- filter(beta_gene, abs(beta_gene$R132C_betas - beta_gene$Parental_betas) >=0.2)
+
+library(VennDiagram)
+venn.diagram(x= list(H$probeID, C$probeID), 
+             category.names = c("R132H", "R132C"),
+             filename = "H_v_C_venn.png")
+#50 overlap so not really... only about 1/3 are shared
+
+
+### make a heatmap that includes all CpG that change in any comparison using the >0.2 change method
+
+#first make a list of probes in any of the lists
+diff_CpG_inclusive <- filter(beta_gene, 
+              abs(beta_gene$R132C_betas - beta_gene$Parental_betas) >=0.2 |
+              abs(beta_gene$R132H_betas - beta_gene$Parental_betas) >=0.2 |
+              abs(beta_gene$R132C_betas - beta_gene$R132C_Ivo_betas) >=0.2 |
+              abs(beta_gene$R132H_betas - beta_gene$R132H_Ivo_betas) >=0.2
+              ) #575 CpGs
+
+#now heatmap
+library(pheatmap)
+pheatmap(t(diff_CpG_inclusive[c(2,5:8)]), show_colnames = FALSE)
+
+#C only
+diff_CpG_C <- filter(beta_gene, 
+              abs(beta_gene$R132C_betas - beta_gene$Parental_betas) >=0.2 |
+              abs(beta_gene$R132C_betas - beta_gene$R132C_Ivo_betas) >=0.2 
+              ) #393 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_C[c(2,7,8)]), show_colnames = FALSE) #heatmap_diff_CpG_C_only
+
+#H only
+diff_CpG_H <- filter(beta_gene, 
+              abs(beta_gene$R132H_betas - beta_gene$Parental_betas) >=0.2 |
+              abs(beta_gene$R132H_betas - beta_gene$R132H_Ivo_betas) >=0.2 
+              ) #261 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_H[c(2,5,6)]), show_colnames = FALSE) #heatmap_diff_CpG_H_only
+
+
+## ok what about just those that are different with the mutant vs parental
+# both C and H
+diff_CpG_muts <- filter(beta_gene, 
+              abs(beta_gene$R132C_betas - beta_gene$Parental_betas) >=0.2 |
+              abs(beta_gene$R132H_betas - beta_gene$Parental_betas) >=0.2 
+              ) #269 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_muts[c(2,5:8)]), show_colnames = FALSE) #heatmap_diff_CpG_C_and_H_mut_v_parent
+
+#C only
+diff_CpG_C_mut <- filter(beta_gene, 
+              abs(beta_gene$R132C_betas - beta_gene$Parental_betas) >=0.2) #180 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_C_mut[c(2,7,8)]), show_colnames = FALSE) #heatmap_diff_CpG_C_only_mut_v_parent
+
+#H only
+diff_CpG_H_mut <- filter(beta_gene, 
+              abs(beta_gene$R132H_betas - beta_gene$Parental_betas) >=0.2) #139 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_H_mut[c(2,5,6)]), show_colnames = FALSE) #heatmap_diff_CpG_H_only_mut_v_parent
+
+
+
+### what about sites that change in mut and return towards parental w/ +Ivo
+  #same change in mut threshold >0.2
+diff_CpG_C_mut <- filter(beta_gene, 
+              abs(beta_gene$R132C_betas - beta_gene$Parental_betas) >=0.2) #180 CpGs
+
+  #now filter for ones that go back with +Ivo... how to define...
+    #A. +Ivo falls between mut and parental
+diff_CpG_C_Ivo_Rescue <- filter(diff_CpG_C_mut, (diff_CpG_C_mut$R132C_Ivo_betas < diff_CpG_C_mut$R132C_betas & 
+                                             diff_CpG_C_mut$R132C_Ivo_betas > diff_CpG_C_mut$Parental_betas)     |
+                                            (diff_CpG_C_mut$R132C_Ivo_betas > diff_CpG_C_mut$Parental_betas & 
+                                             diff_CpG_C_mut$R132C_Ivo_betas < diff_CpG_C_mut$R132C_betas)
+                                ) #106 CpG sites
+
+pheatmap(t(diff_CpG_C_Ivo_Rescue[c(2,7,8)]), show_colnames = FALSE, border_color=NA) #didn't save
+
+
+    #B. if C is higher than parental, keep +Ivo that are lower than C (closer to parental)
+    #   and if C < parental, Ivo > C
+#first, separate into C>parental and C<parental
+C_low <- filter(diff_CpG_C_mut, diff_CpG_C_mut$R132C_betas < diff_CpG_C_mut$Parental_betas) #133
+C_high <- filter(diff_CpG_C_mut, diff_CpG_C_mut$R132C_betas > diff_CpG_C_mut$Parental_betas) #47
+#then, for C_low filter to keep sites where Ivo > C (and opposite for C_high)
+C_low_Ivo <- filter(C_low, C_low$R132C_Ivo_betas > (C_low$R132C_betas+0.1)) #20
+C_high_Ivo <- filter(C_high, C_high$R132C_Ivo_betas < (C_high$R132C_betas-0.1)) #84, so most CpG move in the right direction +Ivo, (without 0.1 difference requirement, only 20 were filtered out)
+
+#last, recombine high and low dfs
+diff_CpG_C_Ivo_Rescue_B <- rbind(C_low_Ivo, C_high_Ivo) #104 CpG total 
+
+pheatmap(t(diff_CpG_C_Ivo_Rescue_B[c(2,7,8)]), show_colnames = FALSE, border_color=NA) #didn't save
+
+## I like definition B better so let's save out that df
+write_delim(diff_CpG_C_Ivo_Rescue_B, "beta_values_w_genome_info_R132C_vs_parental_rescued_wIvo.csv", delim = ",", col_names = TRUE)
+
+
+### repeat for H mut
+diff_CpG_H_mut <- filter(beta_gene, 
+              abs(beta_gene$R132H_betas - beta_gene$Parental_betas) >=0.2) #139 CpGs
+
+    #B. if C is higher than parental, keep +Ivo that are lower than C (closer to parental)
+    #   and if C < parental, Ivo > C
+#first, separate into C>parental and C<parental
+H_low <- filter(diff_CpG_H_mut, diff_CpG_H_mut$R132H_betas < diff_CpG_H_mut$Parental_betas) #53
+H_high <- filter(diff_CpG_H_mut, diff_CpG_H_mut$R132H_betas > diff_CpG_H_mut$Parental_betas) #86
+#then, for H_low filter to keep sites where Ivo > H (and opposite for H_high)
+H_low_Ivo <- filter(H_low, H_low$R132H_Ivo_betas > (H_low$R132H_betas+0.1)) #20
+H_high_Ivo <- filter(H_high, H_high$R132H_Ivo_betas < (H_high$R132H_betas-0.1)) #45
+
+#last, recombine high and low dfs
+diff_CpG_H_Ivo_Rescue_B <- rbind(H_low_Ivo, H_high_Ivo) #65 CpG total 
+
+write_delim(diff_CpG_H_Ivo_Rescue_B, "beta_values_w_genome_info_R132H_vs_parental_rescued_wIvo.csv", delim = ",", col_names = TRUE)
+
+
+```
+
+
+
+
+```{r rebuild data}
+dataDirectory <- "/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis/all_idat_files/"
+
+targets <- read.metharray.sheet("/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis" ,pattern="Wang_16_samplesheet_12082025_csv_SUBSET.csv")
+
+rgSet <- read.metharray.exp(targets=targets)
+
+MSet <- preprocessRaw(rgSet) #change to MethylSet format
+
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+
+gset <- mapToGenome(ratioSet)
+
+#pull out beta values, M values, and copy numbers
+beta <- getBeta(gset)
+#save beta values to one drive to save space on my computer
+#write_delim(rownames_to_column(as.data.frame(beta), "probe_ID"), "beta_values_table_from_minfi.csv", delim = ",", col_names = TRUE)
+
+#normalization
+mSetSq <- preprocessFunnorm(rgSet)
+
+#filtering
+detP <- detectionP(rgSet)
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),]
+keep <- rowSums(detP < 0.01) == ncol(mSetSq)
+mSetSqFlt <- mSetSq[keep,]
+
+```
+
+
+```{r linear model}
+# calculate M-values for statistical analysis: as previously mentioned, M-values have nicer statistical properties and are thus better for use in statistical analysis of methylation data
+mVals <- getM(mSetSqFlt)
+
+# Set up the design matrix for the Differential Methylation analysis
+# Define the factor of interest (treatment status)
+treatment <- factor(targets$Sample_treatment)
+#also want to compare cell type
+CellType <- factor(targets$Sample_cell_type)
+# use the above to create a design matrix
+design <- model.matrix(~0+CellType, data=targets)
+colnames(design) <- c(levels(CellType))
+
+# fit the actual linear model to the data
+fit <- lmFit(mVals, design)
+
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(WT-IDH1_mut,
+                            levels=design)
+contMatrix
+
+
+# fit the contrasts
+fit2 <- contrasts.fit(fit, contMatrix)
+# Rank genes
+fit2 <- eBayes(fit2)
+```
+
+```{r}
+# get the table of results for the first contrast (WT-IDH1_mut)
+DMPs <- topTable(fit2, num=Inf, coef=1)
+head(DMPs)
+?topTable
+
+# Retrieve data from the array annotation package; this is array-specific
+EPIC_ann <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+
+EPIC_ann_Sub <- EPIC_ann[match(rownames(mVals),EPIC_ann$Name),
+                      c(1:4,12:19,24:ncol(EPIC_ann))]
+DMPs <- topTable(fit2, num=Inf, coef=1, genelist=EPIC_ann_Sub)
+head(DMPs)
+
+# The resulting data.frame can easily be written to a CSV file, which can be opened in Excel.
+write.table(DMPs, file="DMPs.csv", sep=",", row.names=FALSE)
+
+# eXtract Beta-values
+bVals <- getBeta(mSetSqFlt)
+
+# Plot most significant differentially methylated CpG
+plotCpg(bVals, cpg="cg15123692_TC11", pheno=targets$Sample_treatment, ylab = "Beta values" )
+```
+### END: Diff. exp linear modeling ###
+

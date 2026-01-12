@@ -1,0 +1,276 @@
+---
+title: "p53_kd_DNA_methyl_analysis"
+output: html_document
+date: "2025-12-19"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+setwd("/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis/")
+#BiocManager::install("limma")
+#BiocManager::install("minfi", force = TRUE)
+#BiocManager::install("SummarizedExperiment", force = TRUE)
+#BiocManager::install("SparseArray")
+#BiocManager::install("missMethyl", force = TRUE)
+#BiocManager::install("minfiData")
+#BiocManager::install("Gviz")
+#BiocManager::install("DMRcate")
+#BiocManager::install("DMRcatedata")
+#BiocManager::install("mCSEA")
+#BiocManager::install("Homo.sapiens")
+#BiocManager::install("sesame")
+#BiocManager::install("tidyverse")
+
+# load packages required for analysis
+library("limma")
+library("minfi")
+library("RColorBrewer")
+library("missMethyl") # Can take a short time...
+library("minfiData")
+library("Gviz")
+library("DMRcate")
+library("DMRcatedata")
+library("stringr")
+library("mCSEA")
+library("sesame")
+library("tidyverse")
+
+
+EPIC_ann <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+
+```
+
+```{r make samples list}
+
+dataDirectory <- "/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis/p53KD_idat_files/"
+# list the files
+list.files(dataDirectory, recursive = TRUE)
+# read in the sample sheet for the experiment
+targets <- read.metharray.sheet("/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis" ,pattern="Wang_16_samplesheet_12082025_csv_p53KD_only.csv")
+
+##note: for some reason, can only have one folder with idat files in the working directory, move extra idat files up one level when not using
+```
+
+
+```{r rebuild data}
+
+rgSet <- read.metharray.exp(targets=targets)
+
+MSet <- preprocessRaw(rgSet) #change to MethylSet format
+
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+
+gset <- mapToGenome(ratioSet)
+
+#pull out beta values, M values, and copy numbers
+beta <- getBeta(gset)
+#save beta values to one drive to save space on my computer
+write_delim(rownames_to_column(as.data.frame(beta), "probe_ID"), "beta_values_table_from_minfi_p53KD.csv", delim = ",", col_names = TRUE)
+
+#normalization
+mSetSq <- preprocessFunnorm(rgSet)
+
+#filtering
+detP <- detectionP(rgSet)
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),]
+keep <- rowSums(detP < 0.01) == ncol(mSetSq)
+mSetSqFlt <- mSetSq[keep,]
+
+```
+
+
+
+PCA
+```{r filtered PCA plot}
+pal <- brewer.pal(8,"Dark2")
+pal2 <- grDevices::rainbow(16)
+custom_pal <- c("forestgreen", "red", "firebrick4", "blue", "cyan3")
+
+#plot dots with legend
+#plot.new()
+par(mar=c(4.1, 4.1, 4.1, 10.1), xpd=TRUE)
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", pch = c(16), col=custom_pal[factor(targets$Sample_Name)]) ##labels = targets$Sample_Name,
+legend("topright", inset=c(-0.3,0), legend=levels(factor(targets$Sample_Name)), text.col=custom_pal, bg="white", cex=0.8, bty = "n")
+# Close plotting window
+dev.off()
+
+#plot labels directly on plot
+#plot.new()
+par(mar=c(4.1, 4.1, 4.1, 4.1), xpd=TRUE)
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", pch = c(16), labels = targets$Sample_Name, col=pal[factor(targets$Sample_Name)]) ##labels = targets$Sample_Name,
+# Close plotting window
+dev.off()
+
+```
+
+
+## Dif exp
+```{r Diff exp: simple comparison}
+beta_gene <- read.csv("beta_values_table_funnorm_ALL_samples_gene_info.csv")
+
+H_over_p53KD_ctl_betas <- filter(beta_gene, beta_gene$p53KD_p53KD_R132H_betas > beta_gene$p53KD_ctl_betas )
+H_under_p53KD_ctl_betas <- filter(beta_gene, beta_gene$p53KD_p53KD_R132H_betas < beta_gene$p53KD_ctl_betas) #60/40, skewed towards H over
+531000 / 925780
+
+beta_gene$R132H_higher_than_Parent <- beta_gene$p53KD_R132H_betas > beta_gene$p53KD_ctl_betas
+beta_gene$R132H_higher_than_wIvo <- beta_gene$p53KD_R132H_betas >= beta_gene$p53KD_R132H_Ivo_betas
+beta_gene$R132C_higher_than_Parent <- beta_gene$p53KD_R132C_betas > beta_gene$p53KD_ctl_betas
+beta_gene$R132C_higher_than_wIvo <- beta_gene$p53KD_R132C_betas >= beta_gene$p53KD_R132C_Ivo_betas
+
+table(beta_gene$R132H_higher_than_Parent)
+# FALSE   TRUE 
+#394,457 531,323 
+
+table(beta_gene$R132H_higher_than_wIvo)
+# FALSE   TRUE 
+#494519 431261   
+
+table(beta_gene$R132C_higher_than_Parent)
+# FALSE   TRUE 
+#374474 551306  
+
+table(beta_gene$R132C_higher_than_wIvo)
+# FALSE   TRUE 
+#407215 518565 
+
+## most of these are ~50/50 
+## let's calculate FC's and set a threshold of 1.5 or 2-fold
+
+FC_betas <- data.frame(probeID = beta_gene$probeID,
+                       R132C_d_Parental_FC = (beta_gene$p53KD_R132C_betas / beta_gene$p53KD_ctl_betas),
+                       R132C_d_Ivo_FC = (beta_gene$p53KD_R132C_betas / beta_gene$p53KD_R132C_Ivo_betas),
+                       R132H_d_Parental_FC = (beta_gene$p53KD_R132H_betas / beta_gene$p53KD_ctl_betas),
+                       R132H_d_Ivo_FC = (beta_gene$p53KD_R132H_betas / beta_gene$p53KD_R132H_Ivo_betas)
+                       )
+#remove inf
+FC_betas <- filter(FC_betas, is.finite(FC_betas$R132H_d_Ivo_FC))
+
+#what does this look like?
+summary(FC_betas[c(2:5)])
+# R132C_d_Parental_FC R132C_d_Ivo_FC     R132H_d_Parental_FC R132H_d_Ivo_FC     
+# Min.   :  0.000     Min.   :  0.0000   Min.   :  0.00215   Min.   :2.213e-03  
+# 1st Qu.:  0.969     1st Qu.:  0.9688   1st Qu.:  0.96386   1st Qu.:9.635e-01  
+# Median :  1.011     Median :  1.0049   Median :  1.00901   Median :9.974e-01  
+# Mean   :  1.033     Mean   :  1.0107   Mean   :  1.02689   Mean   :1.006e+00  
+# 3rd Qu.:  1.058     3rd Qu.:  1.0353   3rd Qu.:  1.05540   3rd Qu.:1.028e+00  
+# Max.   :674.676     Max.   :181.6896   Max.   :676.69952   Max.   :1.870e+02   
+
+
+
+
+##
+### set thresholds based on B-val distribution ###
+##
+#essentially we're asking if CpG go from ~0.1 to ~0.9 so let's ask that more directly
+## based on QC plots, the low and high peaks go from 0-0.2 and 0.8-1 respectively
+
+# are most CpG either <0.2 or >0.8? (exclude center values)
+t <- filter(beta_gene, beta_gene$p53KD_R132H_betas >0.8 & beta_gene$p53KD_ctl_betas <0.2) #2 CpG...
+#what about the other way, methyl in Parental to unmethyl in mut
+t2 <- filter(beta_gene, beta_gene$p53KD_ctl_betas >0.8 & beta_gene$p53KD_R132H_betas <0.2) #1 CpG...
+## how many CpG are <0.2 or >0.8?
+nrow(filter(beta_gene, beta_gene$p53KD_ctl_betas >0.8 | beta_gene$p53KD_ctl_betas<0.2)) #the majority are
+#parental: 654k (71%), R132H: 670K (72%)
+654309 / 925780 
+#yeah, most CpG would be included in the analysis
+
+## I just think there aren't large methylation changes in this data
+### let's get these numbers for all the comparisons, add it to the summary excel and call it a day
+#R132H v Parental
+nrow(filter(beta_gene, beta_gene$p53KD_R132H_betas >0.7 & beta_gene$p53KD_ctl_betas <0.3)) #2
+nrow(filter(beta_gene, beta_gene$p53KD_ctl_betas >0.7 & beta_gene$p53KD_R132H_betas <0.3)) #3
+# R132C v Parental
+nrow(filter(beta_gene, beta_gene$p53KD_R132C_betas >0.7 & beta_gene$p53KD_ctl_betas <0.3)) #3
+nrow(filter(beta_gene, beta_gene$p53KD_ctl_betas >0.7 & beta_gene$p53KD_R132C_betas <0.3)) #0
+#R132H v Ivo
+nrow(filter(beta_gene, beta_gene$p53KD_R132H_betas >0.7 & beta_gene$p53KD_R132H_Ivo_betas <0.3)) #0
+nrow(filter(beta_gene, beta_gene$p53KD_R132H_Ivo_betas >0.7 & beta_gene$p53KD_R132H_betas <0.3)) #4
+#R132C v Ivo
+nrow(filter(beta_gene, beta_gene$p53KD_R132C_betas >0.7 & beta_gene$p53KD_R132C_Ivo_betas <0.3)) #1
+nrow(filter(beta_gene, beta_gene$p53KD_R132C_Ivo_betas >0.7 & beta_gene$p53KD_R132C_betas <0.3)) #0
+
+
+
+##
+### What about anything that changes by >0.2?
+##
+nrow(filter(beta_gene, abs(beta_gene$p53KD_R132C_betas - beta_gene$p53KD_ctl_betas) >=0.2)) #683 CpGs... still not very many considering there are 920k probes
+
+nrow(filter(beta_gene, abs(beta_gene$p53KD_R132H_betas - beta_gene$p53KD_ctl_betas) >=0.2)) #533
+nrow(filter(beta_gene, abs(beta_gene$p53KD_R132C_betas - beta_gene$p53KD_R132C_Ivo_betas) >=0.2)) #142
+nrow(filter(beta_gene, abs(beta_gene$p53KD_R132H_betas - beta_gene$p53KD_R132H_Ivo_betas) >=0.2)) #123
+
+
+# do R132H and R132C have similar genes that change?
+H <- filter(beta_gene, abs(beta_gene$p53KD_R132H_betas - beta_gene$p53KD_ctl_betas) >=0.2)
+C <- filter(beta_gene, abs(beta_gene$p53KD_R132C_betas - beta_gene$p53KD_ctl_betas) >=0.2)
+
+library(VennDiagram)
+venn.diagram(x= list(H$probeID, C$probeID), 
+             category.names = c("R132H", "R132C"),
+             filename = "p53_H_v_C_venn.png")
+#254 overlap out of 962 total (~40% for C, ~50% for H)
+683 + 533 - 254
+254/533
+
+
+### make a heatmap that includes all CpG that change in any comparison using the >0.2 change method
+
+#first make a list of probes in any of the lists
+diff_CpG_inclusive <- filter(beta_gene, 
+              abs(beta_gene$p53KD_R132C_betas - beta_gene$p53KD_ctl_betas) >=0.2 |
+              abs(beta_gene$p53KD_R132H_betas - beta_gene$p53KD_ctl_betas) >=0.2 |
+              abs(beta_gene$p53KD_R132C_betas - beta_gene$p53KD_R132C_Ivo_betas) >=0.2 |
+              abs(beta_gene$p53KD_R132H_betas - beta_gene$p53KD_R132H_Ivo_betas) >=0.2
+              ) #1137 CpGs
+
+#now heatmap
+library(pheatmap)
+pheatmap(t(diff_CpG_inclusive[c(2,5:8)]), show_colnames = FALSE) #heatmap_diff_CpG_C_and_H_p53KD
+
+#C only
+diff_CpG_C <- filter(beta_gene, 
+              abs(beta_gene$p53KD_R132C_betas - beta_gene$p53KD_ctl_betas) >=0.2 |
+              abs(beta_gene$p53KD_R132C_betas - beta_gene$p53KD_R132C_Ivo_betas) >=0.2 
+              ) #773 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_C[c(2,7,8)]), show_colnames = FALSE) #heatmap_diff_CpG_C_only_p53KD
+
+#H only
+diff_CpG_H <- filter(beta_gene, 
+              abs(beta_gene$p53KD_R132H_betas - beta_gene$p53KD_ctl_betas) >=0.2 |
+              abs(beta_gene$p53KD_R132H_betas - beta_gene$p53KD_R132H_Ivo_betas) >=0.2 
+              ) #635 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_H[c(2,5,6)]), show_colnames = FALSE) #heatmap_diff_CpG_H_only_p53KD
+
+
+## ok what about just those that are different with the mutant vs parental
+# both C and H
+diff_CpG_muts <- filter(beta_gene, 
+              abs(beta_gene$p53KD_R132C_betas - beta_gene$p53KD_ctl_betas) >=0.2 |
+              abs(beta_gene$p53KD_R132H_betas - beta_gene$p53KD_ctl_betas) >=0.2 
+              ) #962 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_muts[c(2,5:8)]), show_colnames = FALSE) #heatmap_diff_CpG_C_and_H_mut_v_parent_p53KD
+
+#C only
+diff_CpG_C_mut <- filter(beta_gene, 
+              abs(beta_gene$p53KD_R132C_betas - beta_gene$p53KD_ctl_betas) >=0.2) #683 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_C_mut[c(2,7,8)]), show_colnames = FALSE) #heatmap_diff_CpG_C_only_mut_v_parent_p53KD
+
+#H only
+diff_CpG_H_mut <- filter(beta_gene, 
+              abs(beta_gene$p53KD_R132H_betas - beta_gene$p53KD_ctl_betas) >=0.2) #533 CpGs
+
+#now heatmap
+pheatmap(t(diff_CpG_H_mut[c(2,5,6)]), show_colnames = FALSE) #heatmap_diff_CpG_H_only_mut_v_parent_p53KD
+
+```
+
