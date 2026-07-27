@@ -1,7 +1,8 @@
 # Angiosarcoma_DNA_methylation_analysis
 DNA methylation array analysis for Angiosarcoma samples
-  \n\tEPIC v2 DNA methylation array data
-  \n\tbased on minfi R package
+
+  EPIC v2 DNA methylation array data
+  based on minfi R package
 
 
 ### nbis_tutorial.Rmd ###
