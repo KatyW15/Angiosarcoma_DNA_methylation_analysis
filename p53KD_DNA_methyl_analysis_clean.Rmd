@@ -1,0 +1,162 @@
+---
+title: "p53_kd_DNA_methyl_analysis"
+output: html_document
+date: "2025-12-19"
+editor_options:
+  chunk_output_type: console
+---
+
+## Setup
+
+```{r paths}
+# ---- User-configurable paths ----
+# Update these to point at your own local copies of the data before running.
+project_dir <- "/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis/"
+idat_dir <- file.path(project_dir, "p53KD_idat_files")
+sample_sheet_pattern <- "Wang_16_samplesheet_12082025_csv_p53KD_only.csv"
+beta_gene_csv <- "beta_values_table_funnorm_ALL_samples_gene_info.csv"
+minfi_beta_csv <- "beta_values_table_from_minfi_p53KD.csv"
+output_dir <- file.path(project_dir, "output_plots")
+
+setwd(project_dir)
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+```
+
+```{r setup}
+# Package installation (run once, then leave commented out):
+# BiocManager::install(c("limma", "minfi", "IlluminaHumanMethylationEPICv2anno.20a1.hg38", "IlluminaHumanMethylationEPICv2manifest"))
+# install.packages(c("RColorBrewer", "tidyverse", "VennDiagram", "pheatmap"))
+
+library("limma")
+library("minfi")
+library("RColorBrewer")
+library("tidyverse")
+library("VennDiagram")
+library("pheatmap")
+library("IlluminaHumanMethylationEPICv2manifest") #just the annotation parts from missMethyl
+library("IlluminaHumanMethylationEPICv2anno.20a1.hg38")
+
+EPIC_ann <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+```
+
+## Load sample sheet
+
+```{r make samples list}
+list.files(idat_dir, recursive = TRUE)
+
+targets <- read.metharray.sheet(project_dir, pattern = sample_sheet_pattern)
+
+# Note: read.metharray.sheet only works correctly with a single idat folder
+# present in the working directory - move any extra idat folders up one
+# level when they're not part of the current run.
+```
+
+## Build and preprocess the methylation data
+
+```{r rebuild data}
+rgSet <- read.metharray.exp(targets = targets)
+
+MSet <- preprocessRaw(rgSet) # convert to MethylSet format
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+gset <- mapToGenome(ratioSet)
+
+# pull out beta values and save to save local disk space
+beta <- getBeta(gset)
+write_delim(rownames_to_column(as.data.frame(beta), "probe_ID"), minfi_beta_csv, delim = ",", col_names = TRUE)
+
+# normalize
+mSetSq <- preprocessFunnorm(rgSet)
+
+# filter out probes that fail detection in any sample
+detP <- detectionP(rgSet)
+detP <- detP[match(featureNames(mSetSq), rownames(detP)), ]
+keep <- rowSums(detP < 0.01) == ncol(mSetSq)
+mSetSqFlt <- mSetSq[keep, ]
+```
+
+## Sample clustering (MDS)
+
+```{r MDS plot}
+custom_pal <- c("forestgreen", "red", "firebrick4", "blue", "cyan3")
+
+png(file.path(output_dir, "MDS_plot.png"), width = 1800, height = 1200, res = 200)
+layout(matrix(1:2, nrow = 1), widths = c(3, 1))
+
+par(mar = c(4.1, 4.1, 4.1, 1))
+plotMDS(getM(mSetSq), top = 1000, gene.selection = "common", pch = 16, col = custom_pal[factor(targets$Sample_Name)])
+
+par(mar = c(4.1, 0, 4.1, 0))
+plot.new()
+legend("left", legend = levels(factor(targets$Sample_Name)), text.col = custom_pal, cex = 0.8, bty = "n")
+dev.off()
+```
+
+## Differential methylation analysis
+
+QC of the raw beta-value distributions showed that the large majority of probes are strongly bimodal - most CpGs sit near fully unmethylated (β < 0.2) or fully methylated (β > 0.8), typical of EPIC array data. Fold-change on beta values was not informative on this bounded 0-1 scale (ratios cluster tightly around 1 regardless of true signal), so CpGs were instead classified as differentially methylated between conditions using an absolute difference threshold of |Δβ| ≥ 0.2.
+
+```{r Diff exp: threshold-based differential methylation}
+beta_gene <- read.csv(beta_gene_csv) #generated in DNAme_analysis_clean.Rmd
+
+# differentially methylated CpGs per comparison (|delta beta| >= 0.2)
+diff_CpG_R132C_v_ctl <- filter(beta_gene, abs(p53KD_R132C_betas - p53KD_ctl_betas) >= 0.2)
+diff_CpG_R132H_v_ctl <- filter(beta_gene, abs(p53KD_R132H_betas - p53KD_ctl_betas) >= 0.2)
+diff_CpG_R132C_v_Ivo <- filter(beta_gene, abs(p53KD_R132C_betas - p53KD_R132C_Ivo_betas) >= 0.2)
+diff_CpG_R132H_v_Ivo <- filter(beta_gene, abs(p53KD_R132H_betas - p53KD_R132H_Ivo_betas) >= 0.2)
+
+nrow(diff_CpG_R132C_v_ctl) # 683
+nrow(diff_CpG_R132H_v_ctl) # 533
+nrow(diff_CpG_R132C_v_Ivo) # 142
+nrow(diff_CpG_R132H_v_Ivo) # 123
+```
+
+### Overlap between R132H and R132C (mutant vs. parental)
+
+```{r venn diagram}
+venn.diagram(x = list(diff_CpG_R132H_v_ctl$probeID, diff_CpG_R132C_v_ctl$probeID),
+             category.names = c("R132H", "R132C"),
+             filename = file.path(output_dir, "p53_H_v_C_venn.png"),
+             imagetype = "png")
+# 254 CpGs overlap between the R132H and R132C mutant-vs-parental sets
+# (~37% of R132C's 683, ~48% of R132H's 533)
+```
+
+### Heatmaps
+
+```{r heatmaps}
+p53kd_cols <- c("p53KD_ctl_betas", "p53KD_R132H_betas", "p53KD_R132H_Ivo_betas", "p53KD_R132C_betas", "p53KD_R132C_Ivo_betas")
+
+# all comparisons combined
+diff_CpG_inclusive <- filter(beta_gene,
+              abs(p53KD_R132C_betas - p53KD_ctl_betas) >= 0.2 |
+              abs(p53KD_R132H_betas - p53KD_ctl_betas) >= 0.2 |
+              abs(p53KD_R132C_betas - p53KD_R132C_Ivo_betas) >= 0.2 |
+              abs(p53KD_R132H_betas - p53KD_R132H_Ivo_betas) >= 0.2
+              ) # 1137 CpGs
+pheatmap(t(diff_CpG_inclusive[p53kd_cols]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_C_and_H_p53KD.png"))
+
+# R132C only (vs ctl or vs Ivo)
+diff_CpG_C <- filter(beta_gene,
+              abs(p53KD_R132C_betas - p53KD_ctl_betas) >= 0.2 |
+              abs(p53KD_R132C_betas - p53KD_R132C_Ivo_betas) >= 0.2
+              ) # 773 CpGs
+pheatmap(t(diff_CpG_C[c("p53KD_ctl_betas", "p53KD_R132C_betas", "p53KD_R132C_Ivo_betas")]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_C_only_p53KD.png"))
+
+# R132H only (vs ctl or vs Ivo)
+diff_CpG_H <- filter(beta_gene,
+              abs(p53KD_R132H_betas - p53KD_ctl_betas) >= 0.2 |
+              abs(p53KD_R132H_betas - p53KD_R132H_Ivo_betas) >= 0.2
+              ) # 635 CpGs
+pheatmap(t(diff_CpG_H[c("p53KD_ctl_betas", "p53KD_R132H_betas", "p53KD_R132H_Ivo_betas")]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_H_only_p53KD.png"))
+
+# R132C vs. parental only
+pheatmap(t(diff_CpG_R132C_v_ctl[c("p53KD_ctl_betas", "p53KD_R132C_betas")]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_C_only_mut_v_parent_p53KD.png"))
+
+# R132H vs. parental only
+pheatmap(t(diff_CpG_R132H_v_ctl[c("p53KD_ctl_betas", "p53KD_R132H_betas")]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_H_only_mut_v_parent_p53KD.png"))
+```

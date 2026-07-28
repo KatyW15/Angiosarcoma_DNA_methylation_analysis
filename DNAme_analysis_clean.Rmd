@@ -1,0 +1,328 @@
+---
+title: "DNAme_analysis_clean"
+output: html_document
+date: "2025-12-10"
+editor_options:
+  chunk_output_type: console
+---
+
+Adapted from the NBIS methylation array tutorial:
+https://nbis-workshop-epigenomics.readthedocs.io/en/latest/content/tutorials/methylationArray/Array_Tutorial.html
+
+## Setup
+
+```{r paths}
+# ---- User-configurable paths ----
+# Update these to point at your own local copies of the data before running.
+project_dir <- "/Users/wakaitly/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Wang, Richard's files - Angiosarcoma project/Manuscript/Methylation array/KW_DNA_methylation_analysis/"
+idat_dir <- file.path(project_dir, "all_idat_files")
+sample_sheet_all <- "Wang_16_samplesheet_12082025_csv.csv"
+sample_sheet_corrected <- "Wang_16_samplesheet_12082025_csv_CORRECTED.csv"
+sample_sheet_subset <- "Wang_16_samplesheet_12082025_csv_SUBSET.csv"
+#beta_gene_csv <- "beta_values_table_funnorm_ALL_samples_gene_info.csv" #generated in this rmd, can load here for re-runs
+output_dir <- file.path(project_dir, "output_plots")
+
+setwd(project_dir)
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+```
+
+```{r setup}
+# Package installation (run once, then leave commented out):
+# BiocManager::install(c("limma", "minfi", "IlluminaHumanMethylationEPICv2anno.20a1.hg38", "IlluminaHumanMethylationEPICv2manifest"))
+# install.packages(c("RColorBrewer", "tidyverse", "VennDiagram", "pheatmap"))
+
+library("limma")
+library("minfi")
+library("RColorBrewer")
+library("tidyverse")
+library("VennDiagram")
+library("pheatmap")
+library("IlluminaHumanMethylationEPICv2manifest")
+library("IlluminaHumanMethylationEPICv2anno.20a1.hg38")
+
+EPIC_ann <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+```
+
+## Load sample sheet and raw data
+
+```{r make samples list}
+list.files(idat_dir, recursive = TRUE)
+targets <- read.metharray.sheet(project_dir, pattern = sample_sheet_all)
+
+rgSet <- read.metharray.exp(targets = targets)
+
+# give the samples descriptive names
+targets$ID <- paste(1:16, c("GM", "CM_P", "CM_WT", "WT_Ivo", "H1", "H2", "H_Ivo_1", "H_Ivo_2", "C1", "C2", "C_Ivo_1", "C_Ivo_2", "D2HG", "HT_GM", "HT_CM", "HT_CM_Ivo"), sep = "_")
+sampleNames(rgSet) <- targets$ID
+```
+
+## Quality control
+
+minfi's QC plot compares log median intensity in the methylated and unmethylated channels - good samples cluster together, failed samples separate with lower median intensities. Detection p-values compare each probe's total signal to background (from negative control probes); very small p-values indicate reliable signal, while p > 0.01 generally indicates poor quality. The Beta value density plot is a third check - most CpGs should be close to 0 or 1 (unmethylated/methylated) in a good sample.
+
+```{r QC}
+MSet <- preprocessRaw(rgSet) # convert to MethylSet format for QC
+
+qc <- getQC(MSet)
+detP <- detectionP(rgSet)
+
+png(file.path(output_dir, "QC_panel.png"), width = 2100, height = 800, res = 150)
+par(mfrow = c(1, 3))
+plotQC(qc)
+barplot(colMeans(detP), las = 2, cex.names = 0.8, ylab = "Mean detection p-values")
+abline(h = 0.05, col = "red")
+densityPlot(MSet)
+dev.off()
+
+# all 16 samples cluster together as "good" quality, mean detection p-values
+# are well under the 0.05 cutoff (max ~0.001), and Beta density traces are
+# consistent across samples - all samples passed QC.
+```
+
+## Normalization
+
+```{r normalize}
+mSetSq <- preprocessFunnorm(rgSet)
+
+# within-array check: Beta distributions by probe design type, raw vs. normalized
+typeI <- getProbeInfo(MSet, type = "I")[, c("Name", "nCpG")]
+typeII <- getProbeInfo(MSet, type = "II")[, c("Name", "nCpG")]
+probeTypes <- rbind(typeI, typeII)
+probeTypes$Type <- rep(c("I", "II"), times = c(nrow(typeI), nrow(typeII)))
+
+png(file.path(output_dir, "normalization_by_probe_type.png"), width = 1600, height = 900, res = 150)
+par(mfrow = c(1, 2))
+plotBetasByType(MSet[, 1], main = "Raw", legendPos = FALSE)
+plotBetasByType(getBeta(mSetSq)[, 1], probeTypes = probeTypes, main = "Normalized", legendPos = FALSE)
+dev.off()
+
+# between-array check: overall Beta density, raw vs. normalized
+png(file.path(output_dir, "normalization_density.png"), width = 1600, height = 900, res = 150)
+par(mfrow = c(1, 2))
+densityPlot(rgSet, main = "Raw", legend = FALSE)
+densityPlot(getBeta(mSetSq), main = "Normalized", legend = FALSE)
+dev.off()
+```
+
+## Probe filtering
+
+```{r filter probes}
+detP <- detP[match(featureNames(mSetSq), rownames(detP)), ]
+keep <- rowSums(detP < 0.01) == ncol(mSetSq)
+table(keep) # FALSE: 4295, TRUE: 925780
+
+mSetSqFlt <- mSetSq[keep, ]
+
+# not dropping loci with common SNPs, since some samples carry IDH1 SNPs of interest
+```
+
+## Sample clustering (MDS)
+
+```{r MDS plot}
+pal16 <- grDevices::rainbow(16)
+
+png(file.path(output_dir, "MDS_plot.png"), width = 2000, height = 1200, res = 200)
+layout(matrix(1:2, nrow = 1), widths = c(3, 1.3))
+
+par(mar = c(4.1, 4.1, 4.1, 1))
+plotMDS(getM(mSetSq), top = 1000, gene.selection = "common", pch = 16, col = pal16[factor(targets$Sample_Name)])
+
+par(mar = c(4.1, 0, 4.1, 0))
+plot.new()
+legend("left", legend = levels(factor(targets$Sample_Name)), text.col = pal16, cex = 0.7, ncol = 2, bty = "n")
+dev.off()
+```
+
+## Build the annotated master beta table
+
+Rebuilds the pipeline using the sample sheet with corrected sample labels, producing the annotated Beta value table used throughout the rest of this analysis (and by the p53KD-specific notebook).
+
+```{r rebuild data}
+targets <- read.metharray.sheet(project_dir, pattern = sample_sheet_corrected)
+rgSet <- read.metharray.exp(targets = targets)
+
+MSet <- preprocessRaw(rgSet)
+ratioSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+gset <- mapToGenome(ratioSet)
+
+mSetSq <- preprocessFunnorm(rgSet)
+
+detP <- detectionP(rgSet)
+detP <- detP[match(featureNames(mSetSq), rownames(detP)), ]
+keep <- rowSums(detP < 0.01) == ncol(mSetSq)
+mSetSqFlt <- mSetSq[keep, ]
+
+beta <- as.data.frame(getBeta(mSetSqFlt))
+
+# gene/genomic annotation columns to attach to the Beta table
+EPIC_ann_select <- as.data.frame(EPIC_ann[c(4, 1:3, 18, 19, 28:30, 36)])
+
+beta <- rownames_to_column(beta, "Name")
+beta_gene <- left_join(beta, EPIC_ann_select, by = "Name")
+colnames(beta_gene) <- c("probeID",
+                         "Parental_betas", "IDH1_WT_betas", "IDH1_WT_Ivo_betas", "R132H_betas", "R132H_Ivo_betas", "R132C_betas", "R132C_Ivo_betas", "p53KD_ctl_betas", "p53KD_R132H_betas", "p53KD_R132H_Ivo_betas", "p53KD_R132C_betas", "p53KD_R132C_Ivo_betas", "D2HG_betas", "HT_GM_betas", "HT_CM_betas", "HT_CM_Ivo_betas",
+                         colnames(beta_gene[c((ncol(beta_gene) - 8):ncol(beta_gene))]))
+
+write_delim(beta_gene, beta_gene_csv, delim = ",", col_names = TRUE)
+```
+
+## Targeted gene lookup
+
+Beta values for a gene list of interest (endothelial/angiosarcoma-relevant markers).
+
+```{r gene lookup}
+individ_genes_bvals <- filter(beta_gene, UCSC_RefGene_Name %in% c(
+  "NOS3", "CDH5", "ANGPT2", "GPT2", "TEK", "HMOX1", "CCND1", "MCL1",
+  "PECAM1", "VWF", "SERPINH1", "TIMP1", "SPRY4", "PLP2", "CALCRL", "ICAM2", "SELP"
+))
+# none of these genes show meaningful Beta value differences between samples
+write_delim(individ_genes_bvals, "DM_genes_beta_values_table_funnorm_ALL_samples_gene_info.csv", delim = ",", col_names = TRUE)
+```
+
+## Differential methylation analysis
+
+QC of the raw beta-value distributions showed that the large majority of probes are strongly bimodal - most CpGs sit near fully unmethylated (β < 0.2) or fully methylated (β > 0.8), typical of EPIC array data. Fold-change on beta values was not informative on this bounded 0-1 scale (ratios cluster tightly around 1 regardless of true signal), so CpGs were instead classified as differentially methylated between conditions using an absolute difference threshold of |Δβ| ≥ 0.2. As a sanity check, the same threshold applied to the D2HG sample (a positive control expected to show more pronounced epigenetic drift) recovers more differential CpGs than either mutant, consistent with the threshold behaving sensibly.
+
+```{r Diff exp: threshold-based differential methylation}
+diff_CpG_R132C_v_Parental <- filter(beta_gene, abs(R132C_betas - Parental_betas) >= 0.2)
+diff_CpG_R132H_v_Parental <- filter(beta_gene, abs(R132H_betas - Parental_betas) >= 0.2)
+diff_CpG_R132C_v_Ivo <- filter(beta_gene, abs(R132C_betas - R132C_Ivo_betas) >= 0.2)
+diff_CpG_R132H_v_Ivo <- filter(beta_gene, abs(R132H_betas - R132H_Ivo_betas) >= 0.2)
+diff_CpG_D2HG_v_Parental <- filter(beta_gene, abs(D2HG_betas - Parental_betas) >= 0.2)
+
+nrow(diff_CpG_R132C_v_Parental) # 180
+nrow(diff_CpG_R132H_v_Parental) # 139
+nrow(diff_CpG_R132C_v_Ivo) # 260
+nrow(diff_CpG_R132H_v_Ivo) # 149
+nrow(diff_CpG_D2HG_v_Parental) # 2059 - positive control shows more change, as expected
+```
+
+### Overlap between R132H and R132C (mutant vs. parental)
+
+```{r venn diagram}
+venn.diagram(x = list(diff_CpG_R132H_v_Parental$probeID, diff_CpG_R132C_v_Parental$probeID),
+             category.names = c("R132H", "R132C"),
+             filename = file.path(output_dir, "H_v_C_venn.png"),
+             imagetype = "png")
+# 50 CpGs overlap - only about 1/3 of either set is shared with the other
+```
+
+### Heatmaps
+
+```{r heatmaps}
+all_cols <- c("Parental_betas", "R132H_betas", "R132H_Ivo_betas", "R132C_betas", "R132C_Ivo_betas")
+
+# all comparisons combined
+diff_CpG_inclusive <- filter(beta_gene,
+              abs(R132C_betas - Parental_betas) >= 0.2 |
+              abs(R132H_betas - Parental_betas) >= 0.2 |
+              abs(R132C_betas - R132C_Ivo_betas) >= 0.2 |
+              abs(R132H_betas - R132H_Ivo_betas) >= 0.2
+              ) # 575 CpGs
+pheatmap(t(diff_CpG_inclusive[all_cols]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_C_and_H.png"))
+
+# R132C only (vs parental or vs Ivo)
+diff_CpG_C <- filter(beta_gene,
+              abs(R132C_betas - Parental_betas) >= 0.2 |
+              abs(R132C_betas - R132C_Ivo_betas) >= 0.2
+              ) # 393 CpGs
+pheatmap(t(diff_CpG_C[c("Parental_betas", "R132C_betas", "R132C_Ivo_betas")]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_C_only.png"))
+
+# R132H only (vs parental or vs Ivo)
+diff_CpG_H <- filter(beta_gene,
+              abs(R132H_betas - Parental_betas) >= 0.2 |
+              abs(R132H_betas - R132H_Ivo_betas) >= 0.2
+              ) # 261 CpGs
+pheatmap(t(diff_CpG_H[c("Parental_betas", "R132H_betas", "R132H_Ivo_betas")]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_H_only.png"))
+
+# R132C vs. parental only
+pheatmap(t(diff_CpG_R132C_v_Parental[c("Parental_betas", "R132C_betas")]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_C_only_mut_v_parent.png"))
+
+# R132H vs. parental only
+pheatmap(t(diff_CpG_R132H_v_Parental[c("Parental_betas", "R132H_betas")]), show_colnames = FALSE,
+         filename = file.path(output_dir, "heatmap_diff_CpG_H_only_mut_v_parent.png"))
+```
+
+## Most variable CpGs: Parental vs. R132C
+
+```{r top variant CpGs}
+bVals <- getBeta(mSetSq)
+write_delim(rownames_to_column(as.data.frame(bVals), "probe_ID"), "beta_values_table_from_minfi_Norm_filtered_CORRECTED.csv", delim = ",", col_names = TRUE)
+
+R132CvP_stdev <- rowSds(bVals[, c(1, 6)]) # stdev between Parental (col 1) and R132C (col 6)
+bVals <- as.data.frame(bVals)
+colnames(bVals) <- c("Parental", "IDH1 WT", "IDH1 WT Ivosidenib", "R132H", "R132H Ivosidenib", "R132C", "R132C Ivosidenib", "D2HG")
+bVals$R132CvP_stdev <- unname(R132CvP_stdev)
+bVals_R132CvP_2k <- tail(arrange(bVals, R132CvP_stdev), 2000) # top 2000 most variable CpGs
+
+pheatmap(t(bVals_R132CvP_2k[c("Parental", "R132C", "R132C Ivosidenib")]), show_colnames = FALSE, border_color = NA,
+         filename = file.path(output_dir, "heatmap_top2k_variant_R132C_vs_Parental.png"))
+
+top2k_annotated <- left_join(rownames_to_column(bVals_R132CvP_2k, "Name"), EPIC_ann_select, by = "Name")
+write_delim(top2k_annotated, "beta_values_w_genome_info_R132C_vs_parental_top2k.csv", delim = ",", col_names = TRUE)
+```
+
+## Ivo "rescue" CpGs
+
+CpGs that shift toward parental methylation with +Ivo treatment: mutant-vs-parental CpGs are split into those where the mutant is higher or lower than parental, then filtered to sites where +Ivo moves the value back towards parental by at least 0.1.
+
+```{r Ivo rescue CpGs}
+# R132C
+C_low <- filter(diff_CpG_R132C_v_Parental, R132C_betas < Parental_betas)
+C_high <- filter(diff_CpG_R132C_v_Parental, R132C_betas > Parental_betas)
+C_low_Ivo <- filter(C_low, R132C_Ivo_betas > (R132C_betas + 0.1))
+C_high_Ivo <- filter(C_high, R132C_Ivo_betas < (R132C_betas - 0.1))
+diff_CpG_C_Ivo_Rescue <- rbind(C_low_Ivo, C_high_Ivo) # 104 CpGs
+write_delim(diff_CpG_C_Ivo_Rescue, "beta_values_w_genome_info_R132C_vs_parental_rescued_wIvo.csv", delim = ",", col_names = TRUE)
+
+# R132H
+H_low <- filter(diff_CpG_R132H_v_Parental, R132H_betas < Parental_betas)
+H_high <- filter(diff_CpG_R132H_v_Parental, R132H_betas > Parental_betas)
+H_low_Ivo <- filter(H_low, R132H_Ivo_betas > (R132H_betas + 0.1))
+H_high_Ivo <- filter(H_high, R132H_Ivo_betas < (R132H_betas - 0.1))
+diff_CpG_H_Ivo_Rescue <- rbind(H_low_Ivo, H_high_Ivo) # 65 CpGs
+write_delim(diff_CpG_H_Ivo_Rescue, "beta_values_w_genome_info_R132H_vs_parental_rescued_wIvo.csv", delim = ",", col_names = TRUE)
+```
+
+## Linear model differential analysis (WT vs. IDH1 mutant)
+
+This comparison is underpowered - a single sample per condition, no biological replicates - and no CpGs passed the adjusted p-value threshold. Included here as a documented negative result: the lack of significant hits from formal linear modeling is consistent with the small number of large methylation changes already observed with the threshold-based approach above.
+
+```{r rebuild data subset}
+targets <- read.metharray.sheet(project_dir, pattern = sample_sheet_subset)
+rgSet <- read.metharray.exp(targets = targets)
+
+mSetSq <- preprocessFunnorm(rgSet)
+
+detP <- detectionP(rgSet)
+detP <- detP[match(featureNames(mSetSq), rownames(detP)), ]
+keep <- rowSums(detP < 0.01) == ncol(mSetSq)
+mSetSqFlt <- mSetSq[keep, ]
+```
+
+```{r linear model}
+mVals <- getM(mSetSqFlt)
+
+treatment <- factor(targets$Sample_treatment)
+CellType <- factor(targets$Sample_cell_type)
+design <- model.matrix(~0 + CellType, data = targets)
+colnames(design) <- levels(CellType)
+
+fit <- lmFit(mVals, design)
+contMatrix <- makeContrasts(WT - IDH1_mut, levels = design)
+fit2 <- eBayes(contrasts.fit(fit, contMatrix))
+
+EPIC_ann_Sub <- EPIC_ann[match(rownames(mVals), EPIC_ann$Name), c(1:4, 12:19, 24:ncol(EPIC_ann))]
+DMPs <- topTable(fit2, num = Inf, coef = 1, genelist = EPIC_ann_Sub)
+write.table(DMPs, file = file.path(output_dir, "DMPs.csv"), sep = ",", row.names = FALSE)
+
+# example plot of the top-ranked CpG (not significant after adjustment)
+bVals <- getBeta(mSetSqFlt)
+png(file.path(output_dir, "top_CpG_example.png"), width = 900, height = 700, res = 150)
+plotCpg(bVals, cpg = rownames(DMPs)[1], pheno = targets$Sample_treatment, ylab = "Beta values")
+dev.off()
+```
